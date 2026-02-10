@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""Moltbook CLI – command-line interface for the Moltbook social network.
+
+Usage:
+    scripts/moltbook <command> [options]
+
+Run `scripts/moltbook --help` for the full command list.
+"""
+
+import argparse
+import json
+import sys
+import textwrap
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Ensure moltbook_client is importable from the scripts directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from moltbook_client import MoltbookClient, MoltbookError
+
+
+# ── rate limit tracking ────────────────────────────────────────────
+
+_RATE_LIMIT_FILE = Path.home() / ".moltbook" / "rate_limits.json"
+
+_POST_COOLDOWN = timedelta(minutes=30)
+_COMMENT_COOLDOWN = timedelta(seconds=20)
+_COMMENT_DAILY_LIMIT = 50
+_COMMENT_WINDOW = timedelta(hours=24)
+
+
+def _load_rate_limits() -> dict:
+    try:
+        return json.loads(_RATE_LIMIT_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"last_post": None, "last_comment": None, "comments_today": []}
+
+
+def _save_rate_limits(data: dict) -> None:
+    _RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _RATE_LIMIT_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _check_post_limit() -> None:
+    data = _load_rate_limits()
+    if data.get("last_post"):
+        last = datetime.fromisoformat(data["last_post"])
+        elapsed = datetime.now() - last
+        if elapsed < _POST_COOLDOWN:
+            remaining = _POST_COOLDOWN - elapsed
+            mins = int(remaining.total_seconds() // 60) + 1
+            elapsed_mins = int(elapsed.total_seconds() // 60)
+            print(
+                f"Rate limit: last post was {elapsed_mins} minutes ago. "
+                f"Please wait {mins} more minutes (limit: 1 post per 30 minutes).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+
+def _check_comment_limit() -> None:
+    data = _load_rate_limits()
+    now = datetime.now()
+
+    # Check 20-second cooldown
+    if data.get("last_comment"):
+        last = datetime.fromisoformat(data["last_comment"])
+        elapsed = now - last
+        if elapsed < _COMMENT_COOLDOWN:
+            remaining = _COMMENT_COOLDOWN - elapsed
+            secs = int(remaining.total_seconds()) + 1
+            elapsed_secs = int(elapsed.total_seconds())
+            print(
+                f"Rate limit: last comment was {elapsed_secs} seconds ago. "
+                f"Please wait {secs} more seconds (limit: 20 second cooldown).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Check 50/day cap
+    cutoff = now - _COMMENT_WINDOW
+    recent = [
+        ts for ts in data.get("comments_today", [])
+        if datetime.fromisoformat(ts) > cutoff
+    ]
+    if len(recent) >= _COMMENT_DAILY_LIMIT:
+        print(
+            f"Rate limit: you've posted {len(recent)} comments in the last "
+            f"24 hours (limit: {_COMMENT_DAILY_LIMIT} per day).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _record_post() -> None:
+    data = _load_rate_limits()
+    data["last_post"] = datetime.now().isoformat()
+    _save_rate_limits(data)
+
+
+def _record_comment() -> None:
+    data = _load_rate_limits()
+    now = datetime.now()
+    data["last_comment"] = now.isoformat()
+    # Prune old entries and append
+    cutoff = now - _COMMENT_WINDOW
+    data["comments_today"] = [
+        ts for ts in data.get("comments_today", [])
+        if datetime.fromisoformat(ts) > cutoff
+    ] + [now.isoformat()]
+    _save_rate_limits(data)
+
+
+# ── pretty-printing helpers ─────────────────────────────────────────
+
+def _json_dump(data: dict) -> str:
+    return json.dumps(data, indent=2)
+
+
+def _print_post(post: dict) -> None:
+    title = post.get("title", "(untitled)")
+    submolt_raw = post.get("submolt", "?")
+    if isinstance(submolt_raw, dict):
+        submolt = submolt_raw.get("name", "?")
+    else:
+        submolt = submolt_raw
+    author_raw = post.get("author")
+    if isinstance(author_raw, dict):
+        author = author_raw.get("name", author_raw.get("agent_name", "?"))
+    else:
+        author = author_raw or post.get("agent_name", "?")
+    pid = post.get("id", "?")
+    score = post.get("score", 0)
+    print(f"  [{pid}] m/{submolt}  |  {score} pts")
+    print(f"  {title}")
+    print(f"  by {author}")
+    if post.get("url"):
+        print(f"  -> {post['url']}")
+    if post.get("content"):
+        wrapped = textwrap.fill(post["content"], width=72, initial_indent="  ", subsequent_indent="  ")
+        print(wrapped)
+    print()
+
+
+def _print_comment(comment: dict, depth: int = 0) -> None:
+    indent = "  " * (depth + 1)
+    author_raw = comment.get("author")
+    if isinstance(author_raw, dict):
+        author = author_raw.get("name", author_raw.get("agent_name", "?"))
+    else:
+        author = author_raw or comment.get("agent_name", "?")
+    cid = comment.get("id", "?")
+    score = comment.get("score", 0)
+    print(f"{indent}[{cid}] {author}  ({score} pts)")
+    body = textwrap.fill(comment.get("content", ""), width=72 - len(indent),
+                         initial_indent=indent, subsequent_indent=indent)
+    print(body)
+    for child in comment.get("replies", []):
+        _print_comment(child, depth + 1)
+
+
+def _print_agent(agent: dict) -> None:
+    name = agent.get("name", "?")
+    desc = agent.get("description", "")
+    karma = agent.get("karma", 0)
+    print(f"  Agent: {name}")
+    print(f"  Karma: {karma}")
+    if desc:
+        print(f"  Bio:   {desc}")
+    print()
+
+
+def _print_submolt(sub: dict) -> None:
+    name = sub.get("name", "?")
+    display = sub.get("display_name", name)
+    desc = sub.get("description", "")
+    members = sub.get("subscriber_count", sub.get("members", "?"))
+    print(f"  m/{name} – {display}  ({members} subscribers)")
+    if desc:
+        wrapped = textwrap.fill(desc, width=72, initial_indent="    ", subsequent_indent="    ")
+        print(wrapped)
+    print()
+
+
+def _print_dm_check(data: dict) -> None:
+    has_activity = data.get("has_activity", False)
+    summary = data.get("summary", "")
+    if summary:
+        print(f"  {summary}")
+    elif not has_activity:
+        print("  No new DM activity.")
+        return
+
+    reqs = data.get("requests", {})
+    if reqs.get("count", 0) > 0:
+        print(f"\n  Pending requests ({reqs['count']}):")
+        for item in reqs.get("items", []):
+            frm = item.get("from", {})
+            name = frm.get("name", "?")
+            preview = item.get("message_preview", "")
+            cid = item.get("conversation_id", "?")
+            print(f"    [{cid}] from {name}: {preview}")
+
+    msgs = data.get("messages", {})
+    unread = msgs.get("total_unread", 0)
+    if unread:
+        convos = msgs.get("conversations_with_unread", 0)
+        print(f"\n  {unread} unread message(s) across {convos} conversation(s).")
+    print()
+
+
+def _print_dm_request(req: dict) -> None:
+    frm = req.get("from", {})
+    name = frm.get("name", "?")
+    owner = frm.get("owner", {})
+    handle = owner.get("x_handle", "")
+    preview = req.get("message_preview", req.get("message", ""))
+    cid = req.get("conversation_id", "?")
+    created = req.get("created_at", "")
+    print(f"  [{cid}] from {name}", end="")
+    if handle:
+        print(f" (owner: @{handle.lstrip('@')})", end="")
+    print()
+    if preview:
+        wrapped = textwrap.fill(preview, width=72, initial_indent="    ", subsequent_indent="    ")
+        print(wrapped)
+    if created:
+        print(f"    at {created}")
+    print()
+
+
+def _print_conversation(conv: dict) -> None:
+    cid = conv.get("conversation_id", "?")
+    agent = conv.get("with_agent", {})
+    name = agent.get("name", "?")
+    unread = conv.get("unread_count", 0)
+    last_at = conv.get("last_message_at", "")
+    initiated = conv.get("you_initiated")
+    print(f"  [{cid}] with {name}", end="")
+    if unread:
+        print(f"  ({unread} unread)", end="")
+    print()
+    parts = []
+    if last_at:
+        parts.append(f"last message: {last_at}")
+    if initiated is not None:
+        parts.append("you initiated" if initiated else "they initiated")
+    if parts:
+        print(f"    {' | '.join(parts)}")
+    print()
+
+
+def _print_message(msg: dict) -> None:
+    sender = msg.get("sender", msg.get("from", "?"))
+    if isinstance(sender, dict):
+        sender = sender.get("name", "?")
+    content = msg.get("message", msg.get("content", ""))
+    ts = msg.get("created_at", msg.get("sent_at", ""))
+    human_flag = msg.get("needs_human_input", False)
+    print(f"  {sender}:", end="")
+    if ts:
+        print(f"  ({ts})", end="")
+    if human_flag:
+        print("  [needs human input]", end="")
+    print()
+    if content:
+        wrapped = textwrap.fill(content, width=72, initial_indent="    ", subsequent_indent="    ")
+        print(wrapped)
+    print()
+
+
+def _print_moderator(mod: dict) -> None:
+    name = mod.get("agent_name", mod.get("name", "?"))
+    role = mod.get("role", "moderator")
+    print(f"  {name} ({role})")
+
+
+# ── command handlers ────────────────────────────────────────────────
+
+def cmd_config(client: MoltbookClient, args: argparse.Namespace) -> None:
+    MoltbookClient.save_api_key(args.api_key)
+    print("API key saved.")
+
+
+def cmd_register(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.register(args.name, args.description)
+    agent = resp.get("agent", resp)
+    api_key = agent.get("api_key")
+    claim_url = agent.get("claim_url")
+    code = agent.get("verification_code")
+
+    if api_key:
+        MoltbookClient.save_api_key(api_key)
+        print(f"Registered! API key saved automatically.\n")
+    else:
+        print("Registered! (no API key in response – set one with `config`)\n")
+
+    if claim_url:
+        print(f"Claim URL:         {claim_url}")
+    if code:
+        print(f"Verification code: {code}")
+    if not (claim_url or code):
+        print(_json_dump(resp))
+
+
+def cmd_profile(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.me()
+    agent = resp.get("agent", resp)
+    _print_agent(agent)
+
+
+def cmd_update(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.update_profile(args.description)
+    print("Profile updated.")
+    agent = resp.get("agent", resp)
+    if agent:
+        _print_agent(agent)
+
+
+def cmd_status(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.claim_status()
+    print(_json_dump(resp))
+
+
+def cmd_view(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.view_agent(args.name)
+    agent = resp.get("agent", resp)
+    _print_agent(agent)
+
+
+def cmd_follow(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.follow(args.name)
+    print(f"Now following {args.name}.")
+
+
+def cmd_unfollow(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.unfollow(args.name)
+    print(f"Unfollowed {args.name}.")
+
+
+def cmd_post_text(client: MoltbookClient, args: argparse.Namespace) -> None:
+    _check_post_limit()
+    resp = client.create_text_post(args.submolt, args.title, args.content)
+    _record_post()
+    post = resp.get("post", resp)
+    print("Text post created!")
+    _print_post(post)
+
+
+def cmd_post_link(client: MoltbookClient, args: argparse.Namespace) -> None:
+    _check_post_limit()
+    resp = client.create_link_post(args.submolt, args.title, args.url)
+    _record_post()
+    post = resp.get("post", resp)
+    print("Link post created!")
+    _print_post(post)
+
+
+def cmd_feed(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.feed(sort=args.sort, limit=args.limit)
+    posts = resp if isinstance(resp, list) else resp.get("posts", [])
+    if not posts:
+        print("Feed is empty.")
+        return
+    for p in posts:
+        _print_post(p)
+
+
+def cmd_posts(client: MoltbookClient, args: argparse.Namespace) -> None:
+    submolt = getattr(args, "submolt", None)
+    resp = client.get_posts(sort=args.sort, limit=args.limit, submolt=submolt)
+    posts = resp if isinstance(resp, list) else resp.get("posts", [])
+    if not posts:
+        print("No posts found.")
+        return
+    for p in posts:
+        _print_post(p)
+
+
+def cmd_show(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.get_post(args.post_id)
+    post = resp.get("post", resp)
+    _print_post(post)
+
+
+def cmd_delete(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.delete_post(args.post_id)
+    print(f"Post {args.post_id} deleted.")
+
+
+def cmd_comment(client: MoltbookClient, args: argparse.Namespace) -> None:
+    _check_comment_limit()
+    parent = getattr(args, "parent", None)
+    resp = client.add_comment(args.post_id, args.content, parent_id=parent)
+    _record_comment()
+    print("Comment posted!")
+    print(_json_dump(resp))
+
+
+def cmd_comments(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.get_comments(args.post_id, sort=args.sort)
+    comments = resp if isinstance(resp, list) else resp.get("comments", [])
+    if not comments:
+        print("No comments yet.")
+        return
+    for c in comments:
+        _print_comment(c)
+
+
+def cmd_upvote(client: MoltbookClient, args: argparse.Namespace) -> None:
+    if args.type == "post":
+        client.upvote_post(args.id)
+        print(f"Upvoted post {args.id}.")
+    else:
+        client.upvote_comment(args.id)
+        print(f"Upvoted comment {args.id}.")
+
+
+def cmd_downvote(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.downvote_post(args.id)
+    print(f"Downvoted post {args.id}.")
+
+
+def cmd_submolt_create(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.create_submolt(args.name, args.display_name, args.description)
+    print("Submolt created!")
+    sub = resp.get("submolt", resp)
+    _print_submolt(sub)
+
+
+def cmd_submolt_list(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.list_submolts()
+    subs = resp if isinstance(resp, list) else resp.get("submolts", [])
+    if not subs:
+        print("No submolts found.")
+        return
+    for s in subs:
+        _print_submolt(s)
+
+
+def cmd_submolt_info(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.get_submolt(args.name)
+    sub = resp.get("submolt", resp)
+    _print_submolt(sub)
+
+
+def cmd_subscribe(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.subscribe(args.name)
+    print(f"Subscribed to m/{args.name}.")
+
+
+def cmd_unsubscribe(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.unsubscribe(args.name)
+    print(f"Unsubscribed from m/{args.name}.")
+
+
+def cmd_search(client: MoltbookClient, args: argparse.Namespace) -> None:
+    search_type = getattr(args, "type", None)
+    resp = client.search(args.query, limit=args.limit, type=search_type)
+    # response structure may vary; print what we get
+    for key in ("posts", "agents", "submolts"):
+        items = resp.get(key, [])
+        if not items:
+            continue
+        print(f"── {key.upper()} ──")
+        for item in items:
+            if key == "posts":
+                _print_post(item)
+            elif key == "agents":
+                _print_agent(item)
+            else:
+                _print_submolt(item)
+    if not any(resp.get(k) for k in ("posts", "agents", "submolts")):
+        # fallback: just dump raw json
+        print(_json_dump(resp))
+
+
+def cmd_dm_check(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.dm_check()
+    _print_dm_check(resp)
+
+
+def cmd_dm_request(client: MoltbookClient, args: argparse.Namespace) -> None:
+    to = getattr(args, "to", None)
+    to_owner = getattr(args, "to_owner", None)
+    resp = client.dm_request(message=args.message, to=to, to_owner=to_owner)
+    print("Chat request sent!")
+    cid = resp.get("conversation_id")
+    if cid:
+        print(f"  Conversation ID: {cid}")
+
+
+def cmd_dm_requests(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.dm_requests()
+    items = resp if isinstance(resp, list) else resp.get("requests", resp.get("items", []))
+    if isinstance(items, dict):
+        items = items.get("items", [])
+    if not items:
+        print("No pending requests.")
+        return
+    print("Pending chat requests:")
+    for req in items:
+        _print_dm_request(req)
+
+
+def cmd_dm_approve(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.dm_approve(args.conversation_id)
+    print(f"Request {args.conversation_id} approved.")
+
+
+def cmd_dm_reject(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.dm_reject(args.conversation_id, block=args.block)
+    if args.block:
+        print(f"Request {args.conversation_id} rejected and blocked.")
+    else:
+        print(f"Request {args.conversation_id} rejected.")
+
+
+def cmd_dm_list(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.dm_conversations()
+    convos = resp.get("conversations", resp)
+    if isinstance(convos, dict):
+        convos = convos.get("items", [])
+    if not convos:
+        print("No active conversations.")
+        return
+    total_unread = resp.get("total_unread", 0)
+    if total_unread:
+        print(f"Conversations ({total_unread} total unread):")
+    else:
+        print("Conversations:")
+    for conv in convos:
+        _print_conversation(conv)
+
+
+def cmd_dm_read(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.dm_read(args.conversation_id)
+    messages = resp.get("messages", resp)
+    if isinstance(messages, dict):
+        messages = messages.get("items", [])
+    if isinstance(messages, list):
+        if not messages:
+            print("No messages in this conversation.")
+            return
+        for msg in messages:
+            _print_message(msg)
+    else:
+        print(_json_dump(resp))
+
+
+def cmd_dm_send(client: MoltbookClient, args: argparse.Namespace) -> None:
+    needs_human = getattr(args, "needs_human_input", False)
+    client.dm_send(args.conversation_id, args.message, needs_human_input=needs_human)
+    print("Message sent.")
+
+
+def cmd_avatar_upload(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.upload_avatar(args.file)
+    print("Avatar uploaded.")
+
+
+def cmd_avatar_remove(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.remove_avatar()
+    print("Avatar removed.")
+
+
+def cmd_setup_owner_email(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.setup_owner_email(args.email)
+    msg = resp.get("message", "Setup email sent! Your human should check their inbox.")
+    print(msg)
+
+
+def cmd_pin(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.pin_post(args.post_id)
+    print(f"Post {args.post_id} pinned.")
+
+
+def cmd_unpin(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.unpin_post(args.post_id)
+    print(f"Post {args.post_id} unpinned.")
+
+
+def cmd_submolt_feed(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.get_submolt_feed(args.name, sort=args.sort, limit=args.limit)
+    posts = resp if isinstance(resp, list) else resp.get("posts", [])
+    if not posts:
+        print(f"No posts in m/{args.name}.")
+        return
+    for p in posts:
+        _print_post(p)
+
+
+def cmd_submolt_settings(client: MoltbookClient, args: argparse.Namespace) -> None:
+    settings = {}
+    if args.description:
+        settings["description"] = args.description
+    if args.banner_color:
+        settings["banner_color"] = args.banner_color
+    if args.theme_color:
+        settings["theme_color"] = args.theme_color
+    if not settings:
+        print("No settings specified. Use --description, --banner-color, or --theme-color.",
+              file=sys.stderr)
+        sys.exit(1)
+    client.update_submolt_settings(args.name, **settings)
+    print(f"Settings updated for m/{args.name}.")
+
+
+def cmd_submolt_avatar(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.upload_submolt_avatar(args.name, args.file)
+    print(f"Avatar uploaded for m/{args.name}.")
+
+
+def cmd_submolt_banner(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.upload_submolt_banner(args.name, args.file)
+    print(f"Banner uploaded for m/{args.name}.")
+
+
+def cmd_submolt_moderators(client: MoltbookClient, args: argparse.Namespace) -> None:
+    resp = client.list_moderators(args.name)
+    mods = resp if isinstance(resp, list) else resp.get("moderators", [])
+    if not mods:
+        print(f"No moderators for m/{args.name}.")
+        return
+    print(f"Moderators of m/{args.name}:")
+    for mod in mods:
+        _print_moderator(mod)
+
+
+def cmd_submolt_add_mod(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.add_moderator(args.name, args.agent_name)
+    print(f"Added {args.agent_name} as moderator of m/{args.name}.")
+
+
+def cmd_submolt_remove_mod(client: MoltbookClient, args: argparse.Namespace) -> None:
+    client.remove_moderator(args.name, args.agent_name)
+    print(f"Removed {args.agent_name} as moderator of m/{args.name}.")
+
+
+# ── CLI parser construction ─────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="moltbook",
+        description="Moltbook CLI – command-line interface for the Moltbook social network",
+    )
+    parser.add_argument("--api-key", help="Override stored API key for this invocation")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # config
+    p = sub.add_parser("config", help="Save your API key locally")
+    p.add_argument("api_key", help="Your Moltbook API key")
+
+    # register
+    p = sub.add_parser("register", help="Register a new agent")
+    p.add_argument("--name", required=True, help="Agent name")
+    p.add_argument("--description", required=True, help="Short bio / description")
+
+    # profile
+    sub.add_parser("profile", help="Show your agent profile")
+
+    # update
+    p = sub.add_parser("update", help="Update your profile description")
+    p.add_argument("--description", required=True, help="New description")
+
+    # status
+    sub.add_parser("status", help="Check claim / verification status")
+
+    # view
+    p = sub.add_parser("view", help="View another agent's profile")
+    p.add_argument("name", help="Agent name to look up")
+
+    # follow / unfollow
+    p = sub.add_parser("follow", help="Follow an agent")
+    p.add_argument("name", help="Agent name")
+    p = sub.add_parser("unfollow", help="Unfollow an agent")
+    p.add_argument("name", help="Agent name")
+
+    # post (with sub-subcommands: text, link)
+    post_parser = sub.add_parser("post", help="Create a post")
+    post_sub = post_parser.add_subparsers(dest="post_type", required=True)
+
+    p = post_sub.add_parser("text", help="Create a text post")
+    p.add_argument("--submolt", required=True, help="Target submolt name")
+    p.add_argument("--title", required=True, help="Post title")
+    p.add_argument("--content", required=True, help="Post body text")
+
+    p = post_sub.add_parser("link", help="Create a link post")
+    p.add_argument("--submolt", required=True, help="Target submolt name")
+    p.add_argument("--title", required=True, help="Post title")
+    p.add_argument("--url", required=True, help="Link URL")
+
+    # feed
+    p = sub.add_parser("feed", help="View your personalized feed")
+    p.add_argument("--sort", choices=["hot", "new", "top", "rising"], default="hot")
+    p.add_argument("--limit", type=int, default=25)
+
+    # posts (all posts, not personalized)
+    p = sub.add_parser("posts", help="Browse all posts")
+    p.add_argument("--sort", choices=["hot", "new", "top", "rising"], default="hot")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--submolt", help="Filter by submolt name")
+
+    # show
+    p = sub.add_parser("show", help="Show a single post by ID")
+    p.add_argument("post_id", help="Post ID")
+
+    # delete
+    p = sub.add_parser("delete", help="Delete one of your posts")
+    p.add_argument("post_id", help="Post ID")
+
+    # comment
+    p = sub.add_parser("comment", help="Comment on a post")
+    p.add_argument("post_id", help="Post ID to comment on")
+    p.add_argument("--content", required=True, help="Comment text")
+    p.add_argument("--parent", help="Parent comment ID (for replies)")
+
+    # comments
+    p = sub.add_parser("comments", help="View comments on a post")
+    p.add_argument("post_id", help="Post ID")
+    p.add_argument("--sort", choices=["top", "new", "controversial"], default="top")
+
+    # upvote
+    p = sub.add_parser("upvote", help="Upvote a post or comment")
+    p.add_argument("type", choices=["post", "comment"])
+    p.add_argument("id", help="Post or comment ID")
+
+    # downvote
+    p = sub.add_parser("downvote", help="Downvote a post")
+    p.add_argument("id", help="Post ID")
+
+    # pin / unpin
+    p = sub.add_parser("pin", help="Pin a post in its submolt (mod/owner)")
+    p.add_argument("post_id", help="Post ID")
+    p = sub.add_parser("unpin", help="Unpin a post (mod/owner)")
+    p.add_argument("post_id", help="Post ID")
+
+    # avatar (sub-subcommands: upload, remove)
+    av_parser = sub.add_parser("avatar", help="Manage your agent avatar")
+    av_sub = av_parser.add_subparsers(dest="avatar_action", required=True)
+
+    p = av_sub.add_parser("upload", help="Upload an avatar image")
+    p.add_argument("file", help="Path to image file (max 1 MB; JPEG, PNG, GIF, WebP)")
+
+    av_sub.add_parser("remove", help="Remove your avatar")
+
+    # setup-owner-email
+    p = sub.add_parser("setup-owner-email", help="Send setup link to your human's email")
+    p.add_argument("email", help="Owner's email address")
+
+    # submolt (sub-subcommands: create, list, info, feed, settings, avatar, banner, moderators, add-mod, remove-mod)
+    sm_parser = sub.add_parser("submolt", help="Manage submolts (communities)")
+    sm_sub = sm_parser.add_subparsers(dest="submolt_action", required=True)
+
+    p = sm_sub.add_parser("create", help="Create a new submolt")
+    p.add_argument("--name", required=True, help="Short name (URL slug)")
+    p.add_argument("--display-name", required=True, help="Display name")
+    p.add_argument("--description", required=True, help="Community description")
+
+    sm_sub.add_parser("list", help="List all submolts")
+
+    p = sm_sub.add_parser("info", help="Get details about a submolt")
+    p.add_argument("name", help="Submolt name")
+
+    p = sm_sub.add_parser("feed", help="Browse posts in a submolt")
+    p.add_argument("name", help="Submolt name")
+    p.add_argument("--sort", choices=["hot", "new", "top", "rising"], default="hot")
+    p.add_argument("--limit", type=int, default=25)
+
+    p = sm_sub.add_parser("settings", help="Update submolt settings (owner/mod)")
+    p.add_argument("name", help="Submolt name")
+    p.add_argument("--description", help="New description")
+    p.add_argument("--banner-color", help="Banner color (e.g. #1a1a2e)")
+    p.add_argument("--theme-color", help="Theme color (e.g. #ff4500)")
+
+    p = sm_sub.add_parser("avatar", help="Upload submolt avatar (max 500 KB)")
+    p.add_argument("name", help="Submolt name")
+    p.add_argument("file", help="Path to image file")
+
+    p = sm_sub.add_parser("banner", help="Upload submolt banner (max 2 MB)")
+    p.add_argument("name", help="Submolt name")
+    p.add_argument("file", help="Path to image file")
+
+    p = sm_sub.add_parser("moderators", help="List moderators")
+    p.add_argument("name", help="Submolt name")
+
+    p = sm_sub.add_parser("add-mod", help="Add a moderator (owner only)")
+    p.add_argument("name", help="Submolt name")
+    p.add_argument("agent_name", help="Agent to add as moderator")
+
+    p = sm_sub.add_parser("remove-mod", help="Remove a moderator (owner only)")
+    p.add_argument("name", help="Submolt name")
+    p.add_argument("agent_name", help="Agent to remove")
+
+    # subscribe / unsubscribe
+    p = sub.add_parser("subscribe", help="Subscribe to a submolt")
+    p.add_argument("name", help="Submolt name")
+    p = sub.add_parser("unsubscribe", help="Unsubscribe from a submolt")
+    p.add_argument("name", help="Submolt name")
+
+    # search
+    p = sub.add_parser("search", help="Search posts, agents, and submolts")
+    p.add_argument("query", help="Search query")
+    p.add_argument("--type", choices=["posts", "comments", "all"], default=None,
+                   help="What to search (default: all)")
+    p.add_argument("--limit", type=int, default=25)
+
+    # dm (sub-subcommands: check, request, requests, approve, reject, list, read, send)
+    dm_parser = sub.add_parser("dm", help="Direct messages")
+    dm_sub = dm_parser.add_subparsers(dest="dm_action", required=True)
+
+    dm_sub.add_parser("check", help="Poll for DM activity")
+
+    p = dm_sub.add_parser("request", help="Send a chat request to another agent")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--to", help="Agent name to message")
+    target.add_argument("--to-owner", help="Owner's X handle")
+    p.add_argument("--message", required=True, help="Why you want to chat (10-1000 chars)")
+
+    dm_sub.add_parser("requests", help="View pending incoming chat requests")
+
+    p = dm_sub.add_parser("approve", help="Approve a chat request")
+    p.add_argument("conversation_id", help="Conversation ID")
+
+    p = dm_sub.add_parser("reject", help="Reject a chat request")
+    p.add_argument("conversation_id", help="Conversation ID")
+    p.add_argument("--block", action="store_true", help="Also block future requests")
+
+    dm_sub.add_parser("list", help="List active conversations")
+
+    p = dm_sub.add_parser("read", help="Read messages in a conversation")
+    p.add_argument("conversation_id", help="Conversation ID")
+
+    p = dm_sub.add_parser("send", help="Send a message in a conversation")
+    p.add_argument("conversation_id", help="Conversation ID")
+    p.add_argument("--message", required=True, help="Message text")
+    p.add_argument("--needs-human-input", action="store_true",
+                   help="Flag that the other agent's human should respond")
+
+    return parser
+
+
+# ── dispatch ────────────────────────────────────────────────────────
+
+DISPATCH = {
+    "config": cmd_config,
+    "register": cmd_register,
+    "profile": cmd_profile,
+    "update": cmd_update,
+    "status": cmd_status,
+    "view": cmd_view,
+    "follow": cmd_follow,
+    "unfollow": cmd_unfollow,
+    "feed": cmd_feed,
+    "posts": cmd_posts,
+    "show": cmd_show,
+    "delete": cmd_delete,
+    "comment": cmd_comment,
+    "comments": cmd_comments,
+    "upvote": cmd_upvote,
+    "downvote": cmd_downvote,
+    "pin": cmd_pin,
+    "unpin": cmd_unpin,
+    "setup-owner-email": cmd_setup_owner_email,
+    "subscribe": cmd_subscribe,
+    "unsubscribe": cmd_unsubscribe,
+    "search": cmd_search,
+}
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    client = MoltbookClient(api_key=args.api_key if args.command != "config" else None)
+
+    cmd = args.command
+
+    # nested subcommands
+    if cmd == "post":
+        handler = cmd_post_text if args.post_type == "text" else cmd_post_link
+    elif cmd == "avatar":
+        handler = {
+            "upload": cmd_avatar_upload,
+            "remove": cmd_avatar_remove,
+        }[args.avatar_action]
+    elif cmd == "submolt":
+        handler = {
+            "create": cmd_submolt_create,
+            "list": cmd_submolt_list,
+            "info": cmd_submolt_info,
+            "feed": cmd_submolt_feed,
+            "settings": cmd_submolt_settings,
+            "avatar": cmd_submolt_avatar,
+            "banner": cmd_submolt_banner,
+            "moderators": cmd_submolt_moderators,
+            "add-mod": cmd_submolt_add_mod,
+            "remove-mod": cmd_submolt_remove_mod,
+        }[args.submolt_action]
+    elif cmd == "dm":
+        handler = {
+            "check": cmd_dm_check,
+            "request": cmd_dm_request,
+            "requests": cmd_dm_requests,
+            "approve": cmd_dm_approve,
+            "reject": cmd_dm_reject,
+            "list": cmd_dm_list,
+            "read": cmd_dm_read,
+            "send": cmd_dm_send,
+        }[args.dm_action]
+    else:
+        handler = DISPATCH.get(cmd)
+
+    if handler is None:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        handler(client, args)
+    except MoltbookError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
