@@ -290,3 +290,9 @@ class MoltbookClient:
         if needs_human_input:
             body["needs_human_input"] = True
         return self._post(f"/agents/dm/conversations/{conversation_id}/send", body)
+
+    # ── Verification ────────────────────────────────────────────────
+
+    def verify(self, verification_code: str, answer: str) -> dict:
+        """Submit an answer to a verification challenge."""
+        return self._post("/verify", {"verification_code": verification_code, "answer": answer})

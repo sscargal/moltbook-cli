@@ -9,6 +9,8 @@ Run `scripts/moltbook --help` for the full command list.
 
 import argparse
 import json
+import random
+import re
 import sys
 import textwrap
 from datetime import datetime, timedelta
@@ -24,10 +26,17 @@ from moltbook_client import MoltbookClient, MoltbookError
 
 _RATE_LIMIT_FILE = Path.home() / ".moltbook" / "rate_limits.json"
 
-_POST_COOLDOWN = timedelta(minutes=30)
-_COMMENT_COOLDOWN = timedelta(seconds=20)
+_POST_COOLDOWN_MIN = timedelta(minutes=30)
+_POST_COOLDOWN_BUFFER = timedelta(minutes=5)
+_COMMENT_COOLDOWN_MIN = timedelta(seconds=20)
+_COMMENT_COOLDOWN_BUFFER = timedelta(seconds=10)
 _COMMENT_DAILY_LIMIT = 50
 _COMMENT_WINDOW = timedelta(hours=24)
+
+
+def _random_cooldown(base: timedelta, buffer: timedelta) -> timedelta:
+    """Return base + a random portion of buffer."""
+    return base + timedelta(seconds=random.uniform(0, buffer.total_seconds()))
 
 
 def _load_rate_limits() -> dict:
@@ -42,18 +51,39 @@ def _save_rate_limits(data: dict) -> None:
     _RATE_LIMIT_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def _check_suspension(client: "MoltbookClient") -> None:
+    """Check if the account is suspended and exit with an error if so."""
+    try:
+        resp = client.me()
+        agent = resp.get("agent", resp)
+        if agent.get("suspended"):
+            hint = agent.get("suspension_reason", "Unknown reason")
+            ends = agent.get("suspension_ends", "unknown")
+            print(
+                f"Account suspended: {hint} (ends: {ends})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    except MoltbookError as exc:
+        if exc.status_code == 401 and "suspended" in exc.detail.lower():
+            print(f"Account suspended: {exc.detail}", file=sys.stderr)
+            sys.exit(1)
+        # Other errors (e.g. network) — don't block, let the actual command handle it
+
+
 def _check_post_limit() -> None:
     data = _load_rate_limits()
     if data.get("last_post"):
         last = datetime.fromisoformat(data["last_post"])
+        cooldown = _random_cooldown(_POST_COOLDOWN_MIN, _POST_COOLDOWN_BUFFER)
         elapsed = datetime.now() - last
-        if elapsed < _POST_COOLDOWN:
-            remaining = _POST_COOLDOWN - elapsed
+        if elapsed < cooldown:
+            remaining = cooldown - elapsed
             mins = int(remaining.total_seconds() // 60) + 1
             elapsed_mins = int(elapsed.total_seconds() // 60)
             print(
                 f"Rate limit: last post was {elapsed_mins} minutes ago. "
-                f"Please wait {mins} more minutes (limit: 1 post per 30 minutes).",
+                f"Please wait {mins} more minutes (limit: 1 post per ~30-35 minutes).",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -63,17 +93,18 @@ def _check_comment_limit() -> None:
     data = _load_rate_limits()
     now = datetime.now()
 
-    # Check 20-second cooldown
+    # Check cooldown with random buffer
     if data.get("last_comment"):
         last = datetime.fromisoformat(data["last_comment"])
+        cooldown = _random_cooldown(_COMMENT_COOLDOWN_MIN, _COMMENT_COOLDOWN_BUFFER)
         elapsed = now - last
-        if elapsed < _COMMENT_COOLDOWN:
-            remaining = _COMMENT_COOLDOWN - elapsed
+        if elapsed < cooldown:
+            remaining = cooldown - elapsed
             secs = int(remaining.total_seconds()) + 1
             elapsed_secs = int(elapsed.total_seconds())
             print(
                 f"Rate limit: last comment was {elapsed_secs} seconds ago. "
-                f"Please wait {secs} more seconds (limit: 20 second cooldown).",
+                f"Please wait {secs} more seconds (limit: 20-30 second cooldown).",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -110,6 +141,113 @@ def _record_comment() -> None:
         if datetime.fromisoformat(ts) > cutoff
     ] + [now.isoformat()]
     _save_rate_limits(data)
+
+
+# ── verification helpers ────────────────────────────────────────────
+
+_WORD_TO_NUM = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100,
+}
+
+_ADD_WORDS = {"accelerat", "add", "plus", "total", "combin", "togeth", "increase", "fast"}
+_SUB_WORDS = {"loses", "lost", "minus", "subtract", "remain", "slow", "less", "decrease", "reduc"}
+
+
+def _solve_challenge(challenge: str) -> str:
+    """Parse an obfuscated math challenge and return the answer as 'X.XX'.
+
+    Challenges use obfuscated text with random case, inserted punctuation,
+    and spaces within words. Numbers are spelled out as English words.
+    """
+    # Split on whitespace, strip non-alpha from each token, lowercase
+    tokens = [re.sub(r"[^a-z]", "", t.lower()) for t in challenge.split()]
+    tokens = [t for t in tokens if t]
+
+    # Join without spaces for operation keyword detection
+    joined = "".join(tokens)
+
+    # Extract numbers by trying to merge 1-3 adjacent tokens into known words
+    numbers = []
+    i = 0
+    while i < len(tokens):
+        found = False
+        for span in (3, 2, 1):
+            if i + span <= len(tokens):
+                merged = "".join(tokens[i:i + span])
+                if merged in _WORD_TO_NUM:
+                    numbers.append(_WORD_TO_NUM[merged])
+                    i += span
+                    found = True
+                    break
+        if not found:
+            if tokens[i].isdigit():
+                numbers.append(int(tokens[i]))
+            i += 1
+
+    # Combine compound numbers: "twenty" + "three" → 23
+    combined = []
+    j = 0
+    while j < len(numbers):
+        val = numbers[j]
+        if 20 <= val < 100 and j + 1 < len(numbers) and numbers[j + 1] < 10:
+            val += numbers[j + 1]
+            j += 1
+        combined.append(val)
+        j += 1
+    numbers = combined
+
+    if len(numbers) < 2:
+        return "0.00"
+
+    # Detect operation from joined text (no spaces, so substring search
+    # finds keywords even when the original text split them across tokens)
+    is_sub = any(kw in joined for kw in _SUB_WORDS)
+    is_add = any(kw in joined for kw in _ADD_WORDS)
+
+    if is_sub and not is_add:
+        answer = numbers[0] - numbers[1]
+    else:
+        answer = numbers[0] + numbers[1]
+
+    return f"{answer:.2f}"
+
+
+def _handle_verification(client: "MoltbookClient", resp: dict) -> bool:
+    """If resp contains a verification challenge, solve and submit it.
+
+    Returns True if verification succeeded (or wasn't required),
+    False if verification failed.
+    """
+    if not resp.get("verification_required"):
+        return True
+
+    verification = resp.get("verification")
+    if not verification:
+        print("Verification required but no challenge provided.", file=sys.stderr)
+        return False
+
+    code = verification["code"]
+    challenge = verification["challenge"]
+    answer = _solve_challenge(challenge)
+
+    try:
+        result = client.verify(code, answer)
+    except MoltbookError as exc:
+        print(f"Verification failed: {exc}", file=sys.stderr)
+        return False
+
+    if result.get("success"):
+        print("Verification complete.")
+        return True
+
+    print(f"Verification rejected: {result}", file=sys.stderr)
+    return False
 
 
 # ── pretty-printing helpers ─────────────────────────────────────────
@@ -340,18 +478,26 @@ def cmd_unfollow(client: MoltbookClient, args: argparse.Namespace) -> None:
 
 
 def cmd_post_text(client: MoltbookClient, args: argparse.Namespace) -> None:
+    _check_suspension(client)
     _check_post_limit()
     resp = client.create_text_post(args.submolt, args.title, args.content)
     _record_post()
+    if not _handle_verification(client, resp):
+        print("Post created but verification failed — it may not be published.", file=sys.stderr)
+        sys.exit(1)
     post = resp.get("post", resp)
     print("Text post created!")
     _print_post(post)
 
 
 def cmd_post_link(client: MoltbookClient, args: argparse.Namespace) -> None:
+    _check_suspension(client)
     _check_post_limit()
     resp = client.create_link_post(args.submolt, args.title, args.url)
     _record_post()
+    if not _handle_verification(client, resp):
+        print("Post created but verification failed — it may not be published.", file=sys.stderr)
+        sys.exit(1)
     post = resp.get("post", resp)
     print("Link post created!")
     _print_post(post)
@@ -390,12 +536,17 @@ def cmd_delete(client: MoltbookClient, args: argparse.Namespace) -> None:
 
 
 def cmd_comment(client: MoltbookClient, args: argparse.Namespace) -> None:
+    _check_suspension(client)
     _check_comment_limit()
     parent = getattr(args, "parent", None)
     resp = client.add_comment(args.post_id, args.content, parent_id=parent)
     _record_comment()
+    if not _handle_verification(client, resp):
+        print("Comment created but verification failed — it may not be published.", file=sys.stderr)
+        sys.exit(1)
+    comment = resp.get("comment", resp)
     print("Comment posted!")
-    print(_json_dump(resp))
+    _print_comment(comment)
 
 
 def cmd_comments(client: MoltbookClient, args: argparse.Namespace) -> None:
