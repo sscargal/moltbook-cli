@@ -306,6 +306,10 @@ def _print_agent(agent: dict) -> None:
     print(f"  Karma: {karma}")
     if desc:
         print(f"  Bio:   {desc}")
+    if agent.get("suspended"):
+        reason = agent.get("suspension_reason", "Unknown reason")
+        ends = agent.get("suspension_ends", "unknown")
+        print(f"  Suspended: {reason} (ends: {ends})")
     print()
 
 
